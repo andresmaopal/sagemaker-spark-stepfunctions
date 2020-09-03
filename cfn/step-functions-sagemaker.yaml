@@ -1,0 +1,419 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Step functions end to end workflow for ML (XGBoost)
+
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access into the Airflow web server
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+  S3BucketName:
+    Description: REQUIRED - A new S3 Bucket name. This bucket will be used by Sagemaker for reading and writing model artifacts or hosting data
+    Type: String
+    AllowedPattern: '.+'
+
+
+# Mapping to find the Amazon Linux AMI in each region.
+Mappings:
+  RegionMap:
+    ap-northeast-1:
+      AMI: 'ami-06cd52961ce9f0d85'
+    ap-northeast-2:
+      AMI: 'ami-0a10b2721688ce9d2'
+    ap-northeast-3:
+      AMI: 'ami-0d98120a9fb693f07'
+    ap-south-1:
+      AMI: 'ami-0912f71e06545ad88'
+    ap-southeast-1:
+      AMI: 'ami-08569b978cc4dfa10'
+    ap-southeast-2:
+      AMI: 'ami-09b42976632b27e9b'
+    ca-central-1:
+      AMI: 'ami-0b18956f'
+    eu-central-1:
+      AMI: 'ami-0233214e13e500f77'
+    eu-west-1:
+      AMI: 'ami-047bb4163c506cd98'
+    eu-west-2:
+      AMI: 'ami-f976839e'
+    eu-west-3:
+      AMI: 'ami-0ebc281c20e89ba4b'
+    sa-east-1:
+      AMI: 'ami-07b14488da8ea02a0'
+    us-east-1:
+      AMI: 'ami-0ff8a91507f77f867'
+    us-east-2:
+      AMI: 'ami-0b59bfac6be064b78'
+    us-west-1:
+      AMI: 'ami-0bdb828fd58c52235'
+    us-west-2:
+      AMI: 'ami-a0cfeed8'
+
+Resources:
+  EC2Instance:
+      Type: AWS::EC2::Instance
+      Properties:
+        KeyName: !Ref 'KeyName'
+        SecurityGroups: [!Ref 'ECRBuilderEC2SecurityGroup']
+        InstanceType: 'm4.xlarge'
+        IamInstanceProfile:
+          Ref: EC2InstanceProfile
+        Tags:
+          - Key: Name
+            Value: Airflow
+        ImageId: !FindInMap
+          - RegionMap
+          - !Ref 'AWS::Region'
+          - AMI
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -x
+            exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
+            # Install python3 and its dependencies
+            sudo yum install python36 python36-devel gcc gcc-c++ -y
+            curl -O https://bootstrap.pypa.io/get-pip.py
+            python3 get-pip.py
+            python3 -m pip install pip==9.0.3 --user
+            # Get the latest CloudFormation package
+            echo "Installing aws-cfn"
+            yum install -y aws-cfn-bootstrap
+            # Start cfn-init
+            /opt/aws/bin/cfn-init -v -c install --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+            # Install git
+            echo "Installing git"
+            sudo yum install -y git docker jq
+            # Install boto3
+            echo "Updating boto3"
+            python3 -m pip install boto3 --upgrade --user
+            # Upgrade awscli
+            echo "Updating awscli"
+            python3 -m pip install awscli --upgrade --user
+            python3 -m pip install config
+            echo 'export PATH=/usr/local/bin:~/.local/bin:$PATH' >> ~/.bash_profile
+            source ~/.bash_profile
+            # Install pandas and numpy for data processing
+            echo "Installing numpy"
+            python3 -m pip install --upgrade numpy --user
+            echo "Installing pandas"
+            python3 -m pip install --upgrade pandas --user
+            echo "Installing s3fs"
+            python3 -m pip install --upgrade s3fs --user
+            echo "Installing sagemaker sdk"
+            python3 -m pip install sagemaker==1.72.0 --user
+            EOF
+            /etc/init.d/docker start
+            export ecr_repository=sagemaker-spark-example
+            export tag=:latest
+            export uri_suffix=amazonaws.com
+            export region=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r '.region')
+            export account_id=$(aws sts get-caller-identity --output text --query Account)
+            export spark_repository_uri=$account_id.dkr.ecr.$region.$uri_suffix/$ecr_repository$tag
+            export AWS_REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r '.region')
+            cd ~/sagemaker-ml-pipeline/container
+            docker build -t sagemaker-spark-example .
+            # Create ECR repository and push docker image
+            $(aws ecr get-login --region $region --registry-ids $account_id --no-include-email)
+            aws ecr create-repository --repository-name $ecr_repository --region $region
+            docker tag $ecr_repository$tag $spark_repository_uri
+            docker push $spark_repository_uri
+      Metadata:
+        AWS::CloudFormation::Init:
+          configSets:
+            install:
+              - gcc
+          gcc:
+            packages:
+              yum:
+                gcc: []
+      DependsOn:
+        - ECRBuilderEC2SecurityGroup
+
+  ECRBuilderEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'AirflowEC2SG-${AWS::StackName}'
+      GroupDescription: Enable HTTP access via port 80 + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'StepFunctionsInstance-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: !Sub 'StepFunctionsResourceAccess-${AWS::StackName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                Resource: '*'  
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'StepFunctionsInstanceProfile-${AWS::StackName}'
+      Roles:
+        - Ref: EC2Role
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketName: !Ref 'S3BucketName'  
+
+
+  # Roles - these need breaking down into finegrained roles for each lambda.
+  StepFunctionsSageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'StepFunctionsSageMakerExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'sagemaker.amazonaws.com'
+                - 'states.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess 
+      Path: '/service-role/'
+      Policies:
+        - PolicyName: !Sub 'SageMakerS3BucketAccess-${AWS::StackName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+        - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess 
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - states:*
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+                  - !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule'
+
+  # Step Function state machine
+  StepFunctionsSparkSageMaker:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-workflow-spark-ml" 
+      DefinitionString: !Sub 
+        - |-
+          {
+            "Comment": "Machine Learning Pipeline With Spark",
+            "StartAt": "SageMakerCreateProcessingJob",
+            "States": {
+
+                "SageMakerCreateProcessingJob": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                      "Parameters": {
+                        "AppSpecification": {
+                          "ContainerArguments": [
+                            "s3_input_bucket",
+                            "",
+                            "s3_input_key_prefix",
+                            "${P_s3_input_key_prefix}",
+                            "s3_output_bucket",
+                            "${P_s3_output_bucket}",
+                            "s3_output_key_prefix",
+                            "${P_s3_output_key_prefix}",
+                            "s3_model_bucket",
+                            "${P_s3_model_bucket}",
+                            "s3_mleap_model_prefix",
+                            "${P_s3_mleap_model_prefix}"
+                          ],
+                          "ContainerEntrypoint": [
+                            "/opt/program/submit",
+                            "${P_preprocessing_script_path}"
+                          ],
+                          "ImageUri": "${SparkImageUri}"
+                        },
+                        "Environment": {
+                          "mode": "python"
+                        },
+                        "ProcessingInputs": [
+                          {
+                            "InputName": "code",
+                            "S3Input": {
+                              "LocalPath": "/opt/ml/processing/input/code",
+                              "S3CompressionType": "None",
+                              "S3DataDistributionType": "FullyReplicated",
+                              "S3DataType": "S3Prefix",
+                              "S3InputMode": "File",
+                              "S3Uri": "${P_preprocessing_script_path}"
+                            }
+                          }
+                        ],
+                        "ProcessingJobName": "Preprocspark-${AWS::StackId}",
+                        "ProcessingResources": {
+                          "ClusterConfig": {
+                            "InstanceCount": 2,
+                            "InstanceType": "ml.r5.xlarge",
+                            "VolumeSizeInGB": 30
+                          }
+                        },
+                        "RoleArn": "${StepFunctionsSageMakerExecutionArn}",
+                        "StoppingCondition": {
+                          "MaxRuntimeInSeconds": 3000
+                        }
+                      },
+                      "Next": "XGBoostTrainingJob"
+
+              },
+              "XGBoostTrainingJob": {
+                "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+                "Parameters": {
+                  "AlgorithmSpecification": {
+                    "TrainingImage": "${TrainingUri}",
+                    "TrainingInputMode": "File"
+                  },
+                  "OutputDataConfig": {
+                    "S3OutputPath": "${S3BucketName}"
+                  },
+                  "StoppingCondition": {
+                    "MaxRuntimeInSeconds": 86400
+                  },
+                  "ResourceConfig": {
+                    "InstanceCount": 1,
+                    "InstanceType": "ml.m4.xlarge",
+                    "VolumeSizeInGB": 20
+                  },
+                  "RoleArn": "${StepFunctionsSageMakerExecutionArn}",
+                  "InputDataConfig": [
+                    {
+                      "DataSource": {
+                        "S3DataSource": {
+                          "S3DataDistributionType": "FullyReplicated",
+                          "S3DataType": "S3Prefix",
+                          "S3Uri.$": "$.train_data"
+                        }
+                      },
+                      "ChannelName": "train",
+                      "ContentType": "text/csv"
+                    },
+                    {
+                      "DataSource": {
+                        "S3DataSource": {
+                          "S3DataDistributionType": "FullyReplicated",
+                          "S3DataType": "S3Prefix",
+                          "S3Uri.$": "$.validation_data"
+                        }
+                      },
+                      "ChannelName": "validation",
+                      "ContentType": "text/csv"
+                    }
+                  ],
+                  "HyperParameters": {
+                    "objective": "reg:linear",
+                    "eta": "0.2",
+                    "gamma": "4",
+                    "max_depth": "5",
+                    "num_round": "10",
+                    "subsample": "0.7",
+                    "silent": "0",
+                    "min_child_weight": "6"
+                  },
+                  "TrainingJobName.$": "$.training_job"
+                },
+                "Type": "Task",
+                "Next": "CreatePipeline"
+              },
+              "CreatePipeline": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:452432741922:function:createPipelineModel",
+                "ResultPath": "$",
+                "Next": "ExecuteBatchTransform"
+              },
+              "ExecuteBatchTransform": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:us-east-1:452432741922:function:executeBatchTransform",
+                "ResultPath": "$",
+                "End": true
+              }
+            }
+          }
+
+        - StepFunctionsSageMakerExecutionArn: !GetAtt [StepFunctionsSageMakerExecutionRole, Arn]
+          SparkImageUri: 837454905712.dkr.ecr.us-east-1.amazonaws.com/sagemaker-spark-example:latest
+          TrainingUri: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:0.90-1-cpu-py3
+          S3BucketNamePath: !Sub '${S3BucketName}'
+          P_s3_input_bucket: !Sub '${S3BucketName}'
+          P_s3_input_key_prefix : !Sub 'sagemaker/spark-preprocess-demo/${AWS::StackId}/input/raw/abalone'
+          P_s3_output_bucket : !Sub '${S3BucketName}'
+          P_s3_output_key_prefix : !Sub 'sagemaker/spark-preprocess-demo/${AWS::StackId}/input/preprocessed/abalone'
+          P_s3_model_bucket : !Sub '${S3BucketName}'
+          P_s3_mleap_model_prefix: !Sub 'sagemaker/spark-preprocess-demo/${AWS::StackId}/mleap-model'
+          P_preprocessing_script_path: !Sub 's3://${S3BucketName}/script/preprocess.py'
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+
+
+
