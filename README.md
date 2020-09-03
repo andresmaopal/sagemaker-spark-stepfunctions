@@ -8,4 +8,21 @@ This repository shows a sample example to build, manage and orchestrate large-da
 
 ## Solution architecture and workflow
 
+The following architecture shows both the development and deployment components for production using the different types of SageMaker jobs, from the preprocessing of the dataset, for which we will use the public Abalone dataset, the training using an XGBoost model, the optimization of hyperparameters, inference pipeline and results writing (output). This solution is available in a CloudFormation so it can be reproduced in your own AWS account.
+
 <a href="https://ibb.co/FzS9fYp"><img src="https://i.ibb.co/Pg7RbWk/Arquitectura-spark-workflow.png" alt="Arquitectura-spark-workflow" border="0"></a>
+
+## Steps
+
+1. Deploy on your internal account the CloudFormation stack included on this repo:
+
+https://github.com/andresmaopal/sagemaker-spark-stepfunctions/blob/master/cfn/step-functions-sagemaker.yaml
+
+2. Create a SageMaker Notebook instance (ml.m5.xlarge) and upload the step by step demo Notebook included on this repo (this Notebook references a Dev environment where first all steps are assembled):
+
+https://github.com/andresmaopal/sagemaker-spark-stepfunctions/blob/master/cfn/step-functions-sagemaker.yaml
+
+
+
+
+
