@@ -22,6 +22,13 @@ https://github.com/andresmaopal/sagemaker-spark-stepfunctions/blob/master/cfn/st
 
 https://github.com/andresmaopal/sagemaker-spark-stepfunctions/blob/master/cfn/step-functions-sagemaker.yaml
 
+3. Go to Step Functions on the AWS Console and notice the XXXXXXX-workflow-spark-ml states machine, an execute it.
+
+
+<a href="https://ibb.co/fxjc3Bk"><img src="https://i.ibb.co/jrnpCBy/Screen-Shot-2020-09-03-at-4-35-42-PM.png" alt="Screen-Shot-2020-09-03-at-4-35-42-PM" border="0"></a>
+
+
+
 
 
 
